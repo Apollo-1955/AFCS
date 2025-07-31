@@ -1,0 +1,186 @@
+from imu import MPU6050
+from bmp180 import BMP180
+from time import ticks_us, ticks_diff, time, sleep_ms, sleep
+from machine import Pin, I2C, PWM
+import math
+import os
+
+# === Initialize I2C, MPU6050 ===
+i2c_imu = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
+imu = MPU6050(i2c_imu)
+
+# === BMP180 auto-retry init ===
+i2c_bmp = I2C(1, scl=Pin(3), sda=Pin(2), freq=100000)
+bmp = None
+while bmp is None:
+    try:
+        print("Attempting to connect to BMP180...")
+        bmp = BMP180(i2c_bmp)
+        bmp.oversample_sett = 2
+        bmp.sea_level_pressure = 101325
+        print("BMP180 connected successfully!")
+    except Exception as e:
+        print("BMP180 connection failed:", e)
+        sleep(2)
+
+# === Kalman Filter Setup ===
+Q_angle = 0.001
+Q_bias = 0.003
+R_measure = 0.03
+
+pitch_angle = 0.0
+bias_pitch = 0.0
+P = [[0, 0], [0, 0]]
+prev_time_us = ticks_us()
+boot_time_us = prev_time_us
+
+# === Servo Setup ===
+servo1 = PWM(Pin(9))
+servo2 = PWM(Pin(21))
+servo1.freq(50)
+servo2.freq(50)
+
+def kalman_update(new_angle, new_rate, dt):
+    global pitch_angle, bias_pitch, P
+    rate = new_rate - bias_pitch
+    pitch_angle += dt * rate
+
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle)
+    P[0][1] -= dt * P[1][1]
+    P[1][0] -= dt * P[1][1]
+    P[1][1] += Q_bias * dt
+
+    S = P[0][0] + R_measure
+    K = [P[0][0] / S, P[1][0] / S]
+    y = new_angle - pitch_angle
+    pitch_angle += K[0] * y
+    bias_pitch += K[1] * y
+
+    P[0][0] -= K[0] * P[0][0]
+    P[0][1] -= K[0] * P[0][1]
+    P[1][0] -= K[1] * P[0][0]
+    P[1][1] -= K[1] * P[0][1]
+
+    return pitch_angle
+
+def map_pitch_to_servo(pitch):
+    servo_angle = 180 - pitch
+    return int((servo_angle / 180.0) * 3276) + 3277
+
+# === Center servos ===
+servo1.duty_u16(map_pitch_to_servo(0))
+servo2.duty_u16(map_pitch_to_servo(0))
+
+def reconnect_imu():
+    global i2c_imu, imu
+    try:
+        i2c_imu.deinit()
+    except:
+        pass
+    try:
+        i2c_imu = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
+        imu = MPU6050(i2c_imu)
+        print("IMU reconnected successfully.")
+    except Exception as e:
+        print("IMU reconnection failed:", e)
+
+def get_next_log_filename():
+    n = 1
+    while True:
+        fname = f"log{n}.csv"
+        if fname not in os.listdir():
+            return fname
+        n += 1
+
+# === Create log file with header ===
+filename = get_next_log_filename()
+log_file = open(filename, "w")
+log_file.write(
+    "Timestamp (s),   Altitude (m),   Roll (deg),   Pitch (deg),   Velocity Z (deg/s),   Servo Angle (deg),   Event\n\n"
+)
+log_file.flush()
+last_flush_time = time()
+
+# === Flight Detection Flags ===
+liftoff_detected = False
+apogee_detected = False
+landed_detected = False
+stable_time = 0
+prev_velocity_z = 0
+
+# === MAIN LOOP ===
+while True:
+    try:
+        # === Sensor Read ===
+        ax, ay, az = imu.accel.x, imu.accel.y, imu.accel.z
+        gy = imu.gyro.y
+        gz = imu.gyro.z
+
+        bmp.measure()
+        altitude = bmp.altitude
+
+        # === Kalman Pitch ===
+        pitch_acc = math.atan2(-ax, math.sqrt(ay**2 + az**2)) * (180 / math.pi)
+        current_time_us = ticks_us()
+        dt = ticks_diff(current_time_us, prev_time_us) / 1_000_000.0
+        prev_time_us = current_time_us
+
+        pitch_angle = kalman_update(pitch_acc, gy, dt)
+        pitch_angle = max(-90, min(90, pitch_angle))
+
+        # === Roll, Velocity ===
+        roll = math.atan2(ay, az) * (180 / math.pi)
+        velocity_z = gz  # raw Z-axis rotational velocity
+
+        # === Servo Control ===
+        servo_deg = 180 - pitch_angle
+        servo_val = map_pitch_to_servo(pitch_angle)
+        servo1.duty_u16(servo_val)
+        servo2.duty_u16(servo_val)
+
+        # === Timestamp ===
+        timestamp = ticks_diff(current_time_us, boot_time_us) / 1_000_000.0
+
+        # === Event Detection ===
+        event = ""
+        vertical_accel = az - 1  # approximate net upward acceleration in g's
+
+        # Liftoff detection
+        if not liftoff_detected and vertical_accel > 0.5:
+            liftoff_detected = True
+            event = "🚀 Liftoff"
+
+        # Apogee detection
+        if liftoff_detected and not apogee_detected and prev_velocity_z > 0 and velocity_z <= 0:
+            apogee_detected = True
+            event = "📍 Apogee"
+
+        # Landed detection (after apogee, near 0 velocity and acceleration for 2s)
+        if apogee_detected and not landed_detected:
+            if abs(velocity_z) < 0.3 and abs(vertical_accel) < 0.2:
+                stable_time += dt
+                if stable_time >= 2:
+                    landed_detected = True
+                    event = "✅ Landed"
+            else:
+                stable_time = 0
+
+        # === Log ===
+        log_file.write(
+            f"{timestamp:.2f},           {altitude:.2f},          {roll:.2f},         {pitch_angle:.2f},           {velocity_z:.2f},             {servo_deg:.2f},         {event}\n"
+        )
+
+        prev_velocity_z = velocity_z
+
+        # === Flush every 10 sec ===
+        if time() - last_flush_time >= 10:
+            log_file.flush()
+            last_flush_time = time()
+            print(f"\n[FLUSHED] ⏱ {timestamp:.2f}s | Alt={altitude:.2f} m | Roll={roll:.2f}°")
+
+        print(f"Pitch: {pitch_angle:.2f}° | Roll: {roll:.2f}° | Alt: {altitude:.2f} m", end="\r")
+
+    except Exception as e:
+        print("\n[ERROR]:", e)
+        reconnect_imu()
+        sleep_ms(500)
